@@ -12,11 +12,12 @@ var (
 type ArchiverOption func(*archiverOptions) error
 
 type archiverOptions struct {
-	method      uint16
-	concurrency int
-	bufferSize  int
-	stageDir    string
-	offset      int64
+	method          uint16
+	concurrency     int
+	bufferSize      int
+	stageDir        string
+	offset          int64
+	stableFileOrder bool
 }
 
 // WithArchiverMethod sets the zip method to be used for compressible files.
@@ -69,6 +70,24 @@ func WithStageDirectory(dir string) ArchiverOption {
 func WithArchiverOffset(n int64) ArchiverOption {
 	return func(o *archiverOptions) error {
 		o.offset = n
+		return nil
+	}
+}
+
+// WithStableFileOrder makes the archive output deterministic. Files are still
+// compressed concurrently, but their entries are written to the archive in the
+// order they were enumerated (sorted by name) rather than in the order their
+// compression happens to finish. The same set of input files then always
+// produces the same archive bytes, which is useful when the archive checksum is
+// compared across runs (for example, to detect that a retried upload carries an
+// identical archive).
+//
+// This can slightly reduce throughput when file compression times are uneven,
+// because a fast entry may have to wait for an earlier, slower one before it can
+// be flushed. It has no effect at a concurrency of 1, which is already ordered.
+func WithStableFileOrder() ArchiverOption {
+	return func(o *archiverOptions) error {
+		o.stableFileOrder = true
 		return nil
 	}
 }

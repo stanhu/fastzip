@@ -2,6 +2,7 @@ package fastzip
 
 import (
 	"context"
+	"crypto/sha256"
 	"flag"
 	"fmt"
 	"io"
@@ -110,10 +111,13 @@ func TestArchive(t *testing.T) {
 	}
 
 	tests := map[string][]ArchiverOption{
-		"default options":    nil,
-		"no buffer":          {WithArchiverBufferSize(0)},
-		"with store":         {WithArchiverMethod(zip.Store)},
-		"with concurrency 2": {WithArchiverConcurrency(2)},
+		"default options":     nil,
+		"no buffer":           {WithArchiverBufferSize(0)},
+		"with store":          {WithArchiverMethod(zip.Store)},
+		"with concurrency 2":  {WithArchiverConcurrency(2)},
+		"with stable order":   {WithArchiverConcurrency(4), WithStableFileOrder()},
+		"stable order store":  {WithArchiverMethod(zip.Store), WithStableFileOrder()},
+		"stable concurrency1": {WithArchiverConcurrency(1), WithStableFileOrder()},
 	}
 
 	for tn, opts := range tests {
@@ -133,6 +137,57 @@ func TestArchive(t *testing.T) {
 				}
 			}, opts...)
 		})
+	}
+}
+
+func TestArchiveStableFileOrderIsDeterministic(t *testing.T) {
+	symMode := os.FileMode(0777)
+	if runtime.GOOS == "windows" {
+		symMode = 0666
+	}
+
+	// A mix of many compressible, incompressible, empty, symlink and directory
+	// entries, so that concurrent compression finishes in a different order
+	// from one run to the next. Without stable ordering the resulting archive
+	// bytes would vary; with it they must not.
+	testFiles := map[string]testFile{
+		"dir":        {mode: os.ModeDir | 0777},
+		"empty_dir":  {mode: os.ModeDir | 0777},
+		"symlink":    {mode: os.ModeSymlink | symMode, contents: "dir/file00"},
+		"incompress": {mode: 0666, contents: "A3#bez&OqCusPr)d&D]Vot9Eo0z^5O*VZm3:sO3HptL.H-4cOv"},
+		"empty_file": {mode: 0666},
+	}
+	for i := 0; i < 40; i++ {
+		name := fmt.Sprintf("dir/file%02d", i)
+		testFiles[name] = testFile{
+			mode:     0666,
+			contents: strings.Repeat(fmt.Sprintf("content-%02d-", i), 1024*(i+1)),
+		}
+	}
+
+	files, dir := testCreateFiles(t, testFiles)
+	defer os.RemoveAll(dir)
+
+	archiveSum := func(t *testing.T, opts ...ArchiverOption) [sha256.Size]byte {
+		f, err := ioutil.TempFile("", "fastzip-stable")
+		require.NoError(t, err)
+		defer os.Remove(f.Name())
+		defer f.Close()
+
+		a, err := NewArchiver(f, dir, opts...)
+		require.NoError(t, err)
+		require.NoError(t, a.Archive(context.Background(), files))
+		require.NoError(t, a.Close())
+
+		b, err := os.ReadFile(f.Name())
+		require.NoError(t, err)
+		return sha256.Sum256(b)
+	}
+
+	opts := []ArchiverOption{WithArchiverConcurrency(8), WithStableFileOrder()}
+	want := archiveSum(t, opts...)
+	for i := 0; i < 25; i++ {
+		require.Equal(t, want, archiveSum(t, opts...), "archive checksum changed on run %d", i)
 	}
 }
 

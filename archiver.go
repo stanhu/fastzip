@@ -52,6 +52,11 @@ type Archiver struct {
 	chroot  string
 	m       sync.Mutex
 
+	// order serializes entry writes so the archive is deterministic. It is
+	// non-nil only when the stable file order option is enabled and is created
+	// per Archive call.
+	order *writeSerializer
+
 	compressors map[uint16]zip.Compressor
 }
 
@@ -135,9 +140,21 @@ func (a *Archiver) Archive(ctx context.Context, files map[string]os.FileInfo) (e
 		}
 	}()
 
+	if a.options.stableFileOrder {
+		a.order = newWriteSerializer()
+		// Registered after the wg.Wait deferral above so it runs first (defers
+		// are LIFO): any goroutine blocked on its write turn is released before
+		// we wait on it, avoiding a hang when we return before dispatching every
+		// entry.
+		defer a.order.abort()
+	}
+
 	hdrs := make([]zip.FileHeader, len(names))
 
-	for i, name := range names {
+	// idx numbers the entries that are actually archived, contiguously from 0,
+	// so the write serializer never stalls on a skipped index.
+	idx := 0
+	for _, name := range names {
 		fi := files[name]
 		if fi.Mode()&irregularModes != 0 {
 			continue
@@ -157,7 +174,10 @@ func (a *Archiver) Archive(ctx context.Context, files map[string]os.FileInfo) (e
 			return err
 		}
 
-		hdr := &hdrs[i]
+		entryIdx := idx
+		idx++
+
+		hdr := &hdrs[entryIdx]
 		fileInfoHeader(rel, fi, hdr)
 
 		if ctx.Err() != nil {
@@ -166,10 +186,10 @@ func (a *Archiver) Archive(ctx context.Context, files map[string]os.FileInfo) (e
 
 		switch {
 		case hdr.Mode()&os.ModeSymlink != 0:
-			err = a.createSymlink(path, fi, hdr)
+			err = a.createSymlink(entryIdx, path, fi, hdr)
 
 		case hdr.Mode().IsDir():
-			err = a.createDirectory(fi, hdr)
+			err = a.createDirectory(entryIdx, fi, hdr)
 
 		default:
 			if hdr.UncompressedSize64 > 0 {
@@ -177,12 +197,12 @@ func (a *Archiver) Archive(ctx context.Context, files map[string]os.FileInfo) (e
 			}
 
 			if fp == nil {
-				err = a.createFile(ctx, path, fi, hdr, nil)
+				err = a.createFile(ctx, entryIdx, path, fi, hdr, nil)
 				incOnSuccess(&a.entries, err)
 			} else {
 				f := fp.Get()
 				wg.Go(func() error {
-					err := a.createFile(ctx, path, fi, hdr, f)
+					err := a.createFile(ctx, entryIdx, path, fi, hdr, f)
 					fp.Put(f)
 					incOnSuccess(&a.entries, err)
 					return err
@@ -196,6 +216,20 @@ func (a *Archiver) Archive(ctx context.Context, files map[string]os.FileInfo) (e
 	}
 
 	return wg.Wait()
+}
+
+// writeEntry serializes a single entry's write to the zip. When stable file
+// ordering is enabled the write also waits for its turn, so entries are written
+// in enumeration order regardless of when their compression finished. In both
+// cases fn runs with exclusive access to the underlying zip.Writer.
+func (a *Archiver) writeEntry(idx int, fn func() error) error {
+	if a.order != nil {
+		return a.order.do(idx, fn)
+	}
+
+	a.m.Lock()
+	defer a.m.Unlock()
+	return fn()
 }
 
 func fileInfoHeader(name string, fi os.FileInfo, hdr *zip.FileHeader) {
@@ -216,19 +250,15 @@ func fileInfoHeader(name string, fi os.FileInfo, hdr *zip.FileHeader) {
 	}
 }
 
-func (a *Archiver) createDirectory(fi os.FileInfo, hdr *zip.FileHeader) error {
-	a.m.Lock()
-	defer a.m.Unlock()
-
-	_, err := a.createHeader(fi, hdr)
-	incOnSuccess(&a.entries, err)
-	return err
+func (a *Archiver) createDirectory(idx int, fi os.FileInfo, hdr *zip.FileHeader) error {
+	return a.writeEntry(idx, func() error {
+		_, err := a.createHeader(fi, hdr)
+		incOnSuccess(&a.entries, err)
+		return err
+	})
 }
 
-func (a *Archiver) createSymlink(path string, fi os.FileInfo, hdr *zip.FileHeader) error {
-	a.m.Lock()
-	defer a.m.Unlock()
-
+func (a *Archiver) createSymlink(idx int, path string, fi os.FileInfo, hdr *zip.FileHeader) error {
 	link, err := os.Readlink(path)
 	if err != nil {
 		return err
@@ -241,24 +271,26 @@ func (a *Archiver) createSymlink(path string, fi os.FileInfo, hdr *zip.FileHeade
 	hdr.UncompressedSize64 = hdr.CompressedSize64
 	hdr.CRC32 = crc32.ChecksumIEEE([]byte(link))
 
-	w, err := a.createHeaderRaw(fi, hdr)
-	if err != nil {
-		return err
-	}
+	return a.writeEntry(idx, func() error {
+		w, err := a.createHeaderRaw(fi, hdr)
+		if err != nil {
+			return err
+		}
 
-	_, err = io.WriteString(w, link)
-	incOnSuccess(&a.entries, err)
-	return err
+		_, err = io.WriteString(w, link)
+		incOnSuccess(&a.entries, err)
+		return err
+	})
 }
 
-func (a *Archiver) createFile(ctx context.Context, path string, fi os.FileInfo, hdr *zip.FileHeader, tmp *filepool.File) error {
+func (a *Archiver) createFile(ctx context.Context, idx int, path string, fi os.FileInfo, hdr *zip.FileHeader, tmp *filepool.File) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	return a.compressFile(ctx, f, fi, hdr, tmp)
+	return a.compressFile(ctx, idx, f, fi, hdr, tmp)
 }
 
 // compressFile pre-compresses the file first to a file from the filepool,
@@ -267,12 +299,12 @@ func (a *Archiver) createFile(ctx context.Context, path string, fi os.FileInfo, 
 // If no filepool file is available (when using a concurrency of 1) or the
 // compressed file is larger than the uncompressed version, the file is moved
 // to the zip file using the conventional zip.CreateHeader.
-func (a *Archiver) compressFile(ctx context.Context, f *os.File, fi os.FileInfo, hdr *zip.FileHeader, tmp *filepool.File) error {
+func (a *Archiver) compressFile(ctx context.Context, idx int, f *os.File, fi os.FileInfo, hdr *zip.FileHeader, tmp *filepool.File) error {
 	comp, ok := a.compressors[hdr.Method]
 	// if we don't have the registered compressor, it most likely means Store is
 	// being used, so we revert to non-concurrent behaviour
 	if !ok || tmp == nil {
-		return a.compressFileSimple(ctx, f, fi, hdr)
+		return a.compressFileSimple(ctx, idx, f, fi, hdr)
 	}
 
 	fw, err := comp(tmp)
@@ -296,41 +328,39 @@ func (a *Archiver) compressFile(ctx context.Context, f *os.File, fi os.FileInfo,
 	if hdr.CompressedSize64 > hdr.UncompressedSize64 {
 		f.Seek(0, io.SeekStart)
 		hdr.Method = zip.Store
-		return a.compressFileSimple(ctx, f, fi, hdr)
+		return a.compressFileSimple(ctx, idx, f, fi, hdr)
 	}
 	hdr.CRC32 = tmp.Checksum()
 
-	a.m.Lock()
-	defer a.m.Unlock()
+	return a.writeEntry(idx, func() error {
+		w, err := a.createHeaderRaw(fi, hdr)
+		if err != nil {
+			return err
+		}
 
-	w, err := a.createHeaderRaw(fi, hdr)
-	if err != nil {
+		br.Reset(tmp)
+		_, err = br.WriteTo(countWriter{w, &a.written, ctx})
 		return err
-	}
-
-	br.Reset(tmp)
-	_, err = br.WriteTo(countWriter{w, &a.written, ctx})
-	return err
+	})
 }
 
 // compressFileSimple uses the conventional zip.createHeader. This differs from
 // compressFile as it locks the zip _whilst_ compressing (if the method is not
 // Store).
-func (a *Archiver) compressFileSimple(ctx context.Context, f *os.File, fi os.FileInfo, hdr *zip.FileHeader) error {
+func (a *Archiver) compressFileSimple(ctx context.Context, idx int, f *os.File, fi os.FileInfo, hdr *zip.FileHeader) error {
 	br := bufioReaderPool.Get().(*bufio.Reader)
 	defer bufioReaderPool.Put(br)
 	br.Reset(f)
 
-	a.m.Lock()
-	defer a.m.Unlock()
+	return a.writeEntry(idx, func() error {
+		w, err := a.createHeader(fi, hdr)
+		if err != nil {
+			return err
+		}
 
-	w, err := a.createHeader(fi, hdr)
-	if err != nil {
+		_, err = br.WriteTo(countWriter{w, &a.written, ctx})
 		return err
-	}
-
-	_, err = br.WriteTo(countWriter{w, &a.written, ctx})
-	return err
+	})
 }
 
 func (a *Archiver) createHeaderRaw(fi os.FileInfo, fh *zip.FileHeader) (io.Writer, error) {
