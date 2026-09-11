@@ -205,6 +205,13 @@ func (a *Archiver) Archive(ctx context.Context, files map[string]os.FileInfo) (e
 					err := a.createFile(ctx, entryIdx, path, fi, hdr, f)
 					fp.Put(f)
 					incOnSuccess(&a.entries, err)
+					if err != nil && a.order != nil {
+						// createFile can fail before it reaches its write turn
+						// (for example os.Open or a compression error), leaving
+						// the turn unconsumed. Abort so any later entry waiting on
+						// this one is released instead of blocking wg.Wait below.
+						a.order.abort()
+					}
 					return err
 				})
 			}

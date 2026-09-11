@@ -191,6 +191,58 @@ func TestArchiveStableFileOrderIsDeterministic(t *testing.T) {
 	}
 }
 
+func TestArchiveStableFileOrderFileErrorDoesNotDeadlock(t *testing.T) {
+	// A file that fails to open mid-archive must not strand later entries that
+	// are waiting for their write turn. The failing entry has a low index, so
+	// with stable ordering the higher-index entries block on it.
+	//
+	// The file count is kept at or below the concurrency, so the filepool never
+	// makes the dispatch loop block on Get. The loop finishes and reaches its
+	// final wg.Wait before the goroutines run, which is the case where the
+	// loop's own ctx cancellation check can no longer rescue a stranded turn.
+	testFiles := map[string]testFile{
+		"0_missing": {mode: 0666, contents: "gone"},
+	}
+	for i := 1; i < 8; i++ {
+		testFiles[fmt.Sprintf("%d_file", i)] = testFile{
+			mode:     0666,
+			contents: strings.Repeat("x", 4096),
+		}
+	}
+
+	files, dir := testCreateFiles(t, testFiles)
+	defer os.RemoveAll(dir)
+
+	// Remove the lowest-sorted file from disk while leaving it in the map, so
+	// os.Open fails for it during archiving.
+	require.NoError(t, os.Remove(filepath.Join(dir, "0_missing")))
+
+	done := make(chan error, 1)
+	go func() {
+		f, err := ioutil.TempFile("", "fastzip-deadlock")
+		if err != nil {
+			done <- err
+			return
+		}
+		defer os.Remove(f.Name())
+		defer f.Close()
+
+		a, err := NewArchiver(f, dir, WithArchiverConcurrency(16), WithStableFileOrder())
+		if err != nil {
+			done <- err
+			return
+		}
+		done <- a.Archive(context.Background(), files)
+	}()
+
+	select {
+	case err := <-done:
+		require.Error(t, err, "expected the missing file to fail the archive")
+	case <-time.After(30 * time.Second):
+		t.Fatal("Archive deadlocked on a file error with stable file order")
+	}
+}
+
 func TestArchiveCancelContext(t *testing.T) {
 	twoMB := strings.Repeat("1", 2*1024*1024)
 	testFiles := map[string]testFile{}
