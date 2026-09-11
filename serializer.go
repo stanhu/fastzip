@@ -21,13 +21,56 @@ type writeSerializer struct {
 
 	// pending holds writes registered with enqueue whose turn hasn't come yet.
 	// They run, in order, from whichever call advances next to their index.
-	pending map[int]func() error
+	pending map[int]pendingWrite
+
+	// pendingBytes is the total size of entry data held in memory by queued
+	// file writes; reserve refuses to exceed maxPendingBytes.
+	pendingBytes, maxPendingBytes int64
 }
 
-func newWriteSerializer() *writeSerializer {
-	s := &writeSerializer{pending: make(map[int]func() error)}
+// pendingWrite is a queued write and the in-memory budget it holds until run.
+type pendingWrite struct {
+	fn func() error
+	n  int64
+}
+
+func newWriteSerializer(maxPendingBytes int64) *writeSerializer {
+	s := &writeSerializer{pending: make(map[int]pendingWrite), maxPendingBytes: maxPendingBytes}
 	s.cond = sync.NewCond(&s.mu)
 	return s
+}
+
+// tryDo runs fn now if it is idx's turn and reports whether it ran.
+func (s *writeSerializer) tryDo(idx int, fn func() error) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.aborted {
+		return true, nil
+	}
+	if s.next != idx {
+		return false, nil
+	}
+	return true, s.run(fn, 0)
+}
+
+// reserve claims n bytes of the in-memory budget for a queued write. The
+// budget is returned when the write runs or the serializer is aborted, or by
+// release if the caller gives up before queueing it.
+func (s *writeSerializer) reserve(n int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pendingBytes+n > s.maxPendingBytes {
+		return false
+	}
+	s.pendingBytes += n
+	return true
+}
+
+// release returns n bytes claimed with reserve that were never queued.
+func (s *writeSerializer) release(n int64) {
+	s.mu.Lock()
+	s.pendingBytes -= n
+	s.mu.Unlock()
 }
 
 // do blocks until it is idx's turn to write, runs fn while holding the write
@@ -51,7 +94,7 @@ func (s *writeSerializer) do(idx int, fn func() error) error {
 		return nil
 	}
 
-	return s.run(fn)
+	return s.run(fn, 0)
 }
 
 // enqueue registers a write that must not block the caller. If it is already
@@ -65,39 +108,48 @@ func (s *writeSerializer) do(idx int, fn func() error) error {
 // error is returned from whichever do or enqueue call ran it; since any error
 // aborts the archive, it doesn't matter which caller reports it.
 func (s *writeSerializer) enqueue(idx int, fn func() error) error {
+	return s.enqueueBytes(idx, 0, fn)
+}
+
+// enqueueBytes is enqueue for a write holding n bytes previously claimed with
+// reserve; the budget is returned once the write has run.
+func (s *writeSerializer) enqueueBytes(idx int, n int64, fn func() error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.aborted {
+		s.pendingBytes -= n
 		return nil
 	}
 
 	if s.next != idx {
-		s.pending[idx] = fn
+		s.pending[idx] = pendingWrite{fn, n}
 		return nil
 	}
 
-	return s.run(fn)
+	return s.run(fn, n)
 }
 
 // run executes fn as entry next, then drains consecutive pending entries.
 // The caller must hold s.mu.
-func (s *writeSerializer) run(fn func() error) error {
+func (s *writeSerializer) run(fn func() error, n int64) error {
 	defer s.cond.Broadcast()
 
 	for {
-		if err := fn(); err != nil {
+		err := fn()
+		s.pendingBytes -= n
+		if err != nil {
 			s.aborted = true
 			return err
 		}
 		s.next++
 
-		var ok bool
-		fn, ok = s.pending[s.next]
+		pw, ok := s.pending[s.next]
 		if !ok {
 			return nil
 		}
 		delete(s.pending, s.next)
+		fn, n = pw.fn, pw.n
 	}
 }
 

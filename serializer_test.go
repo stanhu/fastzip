@@ -9,7 +9,7 @@ import (
 )
 
 func TestWriteSerializerOrdersWrites(t *testing.T) {
-	s := newWriteSerializer()
+	s := newWriteSerializer(0)
 
 	var got []int
 	record := func(i int) func() error {
@@ -48,7 +48,7 @@ func TestWriteSerializerOrdersWrites(t *testing.T) {
 }
 
 func TestWriteSerializerQueuedErrorAborts(t *testing.T) {
-	s := newWriteSerializer()
+	s := newWriteSerializer(0)
 	boom := errors.New("boom")
 
 	require.NoError(t, s.enqueue(1, func() error { return boom }))
@@ -65,7 +65,7 @@ func TestWriteSerializerQueuedErrorAborts(t *testing.T) {
 }
 
 func TestWriteSerializerAbortReleasesWaiters(t *testing.T) {
-	s := newWriteSerializer()
+	s := newWriteSerializer(0)
 
 	ran := false
 	done := make(chan error)
@@ -75,4 +75,28 @@ func TestWriteSerializerAbortReleasesWaiters(t *testing.T) {
 	s.abort()
 	require.NoError(t, <-done)
 	require.False(t, ran)
+}
+
+func TestWriteSerializerMemoryBudget(t *testing.T) {
+	s := newWriteSerializer(10)
+
+	require.True(t, s.reserve(6))
+	require.False(t, s.reserve(5), "over budget")
+	require.True(t, s.reserve(4))
+
+	// Budget is returned when a queued write runs, or when it is released
+	// without being queued.
+	require.NoError(t, s.enqueueBytes(1, 6, func() error { return nil }))
+	s.release(4)
+	require.False(t, s.reserve(5), "queued write still holds its bytes")
+
+	require.NoError(t, s.do(0, func() error { return nil }))
+	require.True(t, s.reserve(10), "budget returned after the queued write ran")
+	s.release(10)
+
+	// Queueing after an abort drops the write and returns its bytes.
+	s.abort()
+	require.True(t, s.reserve(10))
+	require.NoError(t, s.enqueueBytes(2, 10, func() error { return nil }))
+	require.Equal(t, int64(0), s.pendingBytes)
 }

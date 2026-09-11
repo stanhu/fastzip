@@ -2,6 +2,7 @@ package fastzip
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"hash/crc32"
@@ -144,7 +145,14 @@ func (a *Archiver) Archive(ctx context.Context, files map[string]os.FileInfo) (e
 	// concurrency of 1 the dispatch loop already writes them in order.
 	a.order = nil
 	if a.options.stableFileOrder && fp != nil {
-		a.order = newWriteSerializer()
+		// Entries that finish before their turn may be copied out of their
+		// filepool slot and held in memory until written, up to this budget.
+		// Tie it to the filepool's own footprint so memory scales the same way.
+		bufferSize := a.options.bufferSize
+		if bufferSize < 0 {
+			bufferSize = filepool.DefaultBufferSize
+		}
+		a.order = newWriteSerializer(int64(concurrency) * int64(bufferSize))
 		// Registered after the wg.Wait deferral above so it runs first (defers
 		// are LIFO): any goroutine blocked on its write turn is released before
 		// we wait on it, avoiding a hang when we return before dispatching every
@@ -358,15 +366,9 @@ func (a *Archiver) compressFile(ctx context.Context, idx int, f *os.File, fi os.
 	}
 	hdr.CRC32 = tmp.Checksum()
 
-	return a.writeEntry(idx, func() error {
-		w, err := a.createHeaderRaw(fi, hdr)
-		if err != nil {
-			return err
-		}
-
-		br.Reset(tmp)
-		_, err = br.WriteTo(countWriter{w, &a.written, ctx})
-		return err
+	br.Reset(tmp)
+	return a.writeFileEntry(ctx, idx, int64(hdr.CompressedSize64), br, func() (io.Writer, error) {
+		return a.createHeaderRaw(fi, hdr)
 	})
 }
 
@@ -378,15 +380,63 @@ func (a *Archiver) compressFileSimple(ctx context.Context, idx int, f *os.File, 
 	defer bufioReaderPool.Put(br)
 	br.Reset(f)
 
-	return a.writeEntry(idx, func() error {
-		w, err := a.createHeader(fi, hdr)
+	return a.writeFileEntry(ctx, idx, int64(hdr.UncompressedSize64), br, func() (io.Writer, error) {
+		return a.createHeader(fi, hdr)
+	})
+}
+
+// writeFileEntry writes a file entry whose data is available from src, which
+// is expected to hold n bytes. create opens the entry in the zip once the write
+// has exclusive access to it.
+//
+// Without stable ordering, or when it is already this entry's turn, the data is
+// streamed from src. Otherwise the caller would have to wait for earlier
+// entries while holding its filepool slot, which starves the pool when many
+// small files sit behind a slow one. So if n fits the serializer's memory
+// budget, the data is copied out of src and the write queued, letting the
+// caller return its slot right away. Over budget, it waits with the slot.
+func (a *Archiver) writeFileEntry(ctx context.Context, idx int, n int64, src io.Reader, create func() (io.Writer, error)) error {
+	write := func(r io.Reader) error {
+		w, err := create()
 		if err != nil {
 			return err
 		}
 
-		_, err = br.WriteTo(countWriter{w, &a.written, ctx})
+		_, err = io.Copy(countWriter{w, &a.written, ctx}, r)
 		return err
-	})
+	}
+
+	if a.order == nil {
+		return a.writeEntry(idx, func() error { return write(src) })
+	}
+
+	if ran, err := a.order.tryDo(idx, func() error { return write(src) }); ran {
+		return err
+	}
+
+	if !a.order.reserve(n) {
+		return a.order.do(idx, func() error { return write(src) })
+	}
+
+	// Read one byte past n so a source that grew since it was stat'd is
+	// noticed rather than silently truncated.
+	buf := make([]byte, n+1)
+	m, err := io.ReadFull(src, buf)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		a.order.release(n)
+		return err
+	}
+	if m <= int(n) {
+		return a.order.enqueueBytes(idx, n, func() error {
+			return write(bytes.NewReader(buf[:m]))
+		})
+	}
+
+	// Larger than expected: write everything, including what was already
+	// read, from the source once it is our turn.
+	a.order.release(n)
+	src = io.MultiReader(bytes.NewReader(buf), src)
+	return a.order.do(idx, func() error { return write(src) })
 }
 
 func (a *Archiver) createHeaderRaw(fi os.FileInfo, fh *zip.FileHeader) (io.Writer, error) {

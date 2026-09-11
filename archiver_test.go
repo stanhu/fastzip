@@ -116,6 +116,7 @@ func TestArchive(t *testing.T) {
 		"with store":          {WithArchiverMethod(zip.Store)},
 		"with concurrency 2":  {WithArchiverConcurrency(2)},
 		"with stable order":   {WithArchiverConcurrency(4), WithStableFileOrder()},
+		"stable no buffer":    {WithArchiverConcurrency(4), WithArchiverBufferSize(0), WithStableFileOrder()},
 		"stable order store":  {WithArchiverMethod(zip.Store), WithStableFileOrder()},
 		"stable concurrency1": {WithArchiverConcurrency(1), WithStableFileOrder()},
 	}
@@ -221,6 +222,60 @@ func TestArchiveStableFileOrderIsDeterministic(t *testing.T) {
 	for i := 0; i < 25; i++ {
 		require.Equal(t, want, archiveSum(t, opts...), "archive checksum changed on run %d", i)
 	}
+
+	// A zero buffer size leaves no memory budget for queued writes, so every
+	// file entry waits for its turn instead. The bytes must not depend on
+	// which path was taken.
+	noBuffer := append([]ArchiverOption{WithArchiverBufferSize(0)}, opts...)
+	for i := 0; i < 5; i++ {
+		require.Equal(t, want, archiveSum(t, noBuffer...), "archive checksum differs without a memory budget on run %d", i)
+	}
+}
+
+func TestArchiveStableFileOrderFileGrownAfterStat(t *testing.T) {
+	// With stable ordering, a Store entry that isn't yet its turn is copied
+	// into memory using the size recorded at stat time. A file that grew since
+	// must still be archived whole.
+	testFiles := map[string]testFile{
+		"0_slow": {mode: 0666, contents: strings.Repeat("slow ", 200000)},
+	}
+	for i := 1; i < 8; i++ {
+		testFiles[fmt.Sprintf("%d_file", i)] = testFile{mode: 0666, contents: "short"}
+	}
+
+	files, dir := testCreateFiles(t, testFiles)
+	defer os.RemoveAll(dir)
+
+	grown := filepath.Join(dir, "4_file")
+	require.NoError(t, os.WriteFile(grown, []byte("short but then it grew"), 0666))
+
+	f, err := ioutil.TempFile("", "fastzip-grown")
+	require.NoError(t, err)
+	defer os.Remove(f.Name())
+	defer f.Close()
+
+	a, err := NewArchiver(f, dir, WithArchiverConcurrency(4), WithArchiverMethod(zip.Store), WithStableFileOrder())
+	require.NoError(t, err)
+	require.NoError(t, a.Archive(context.Background(), files))
+	require.NoError(t, a.Close())
+
+	b, err := os.ReadFile(f.Name())
+	require.NoError(t, err)
+	zr, err := zip.NewReader(f, int64(len(b)))
+	require.NoError(t, err)
+	for _, zf := range zr.File {
+		if zf.Name != "4_file" {
+			continue
+		}
+		rc, err := zf.Open()
+		require.NoError(t, err)
+		got, err := io.ReadAll(rc)
+		require.NoError(t, err)
+		require.NoError(t, rc.Close())
+		require.Equal(t, "short but then it grew", string(got))
+		return
+	}
+	t.Fatal("4_file not found in archive")
 }
 
 func TestArchiveStableFileOrderFileErrorDoesNotDeadlock(t *testing.T) {
