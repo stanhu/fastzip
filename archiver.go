@@ -140,7 +140,10 @@ func (a *Archiver) Archive(ctx context.Context, files map[string]os.FileInfo) (e
 		}
 	}()
 
-	if a.options.stableFileOrder {
+	// Ordering only matters when entries are written concurrently; at a
+	// concurrency of 1 the dispatch loop already writes them in order.
+	a.order = nil
+	if a.options.stableFileOrder && fp != nil {
 		a.order = newWriteSerializer()
 		// Registered after the wg.Wait deferral above so it runs first (defers
 		// are LIFO): any goroutine blocked on its write turn is released before
@@ -239,6 +242,22 @@ func (a *Archiver) writeEntry(idx int, fn func() error) error {
 	return fn()
 }
 
+// writeEntryNoWait is writeEntry for entries that are written from the
+// dispatch loop and hold no filepool file (directories and symlinks). With
+// stable file ordering the write is queued rather than waited for, so the loop
+// keeps dispatching files instead of draining every in-flight compression each
+// time it meets a directory. The queued write runs, in order, from whichever
+// goroutine completes the entry before it; its error surfaces there.
+func (a *Archiver) writeEntryNoWait(idx int, fn func() error) error {
+	if a.order != nil {
+		return a.order.enqueue(idx, fn)
+	}
+
+	a.m.Lock()
+	defer a.m.Unlock()
+	return fn()
+}
+
 func fileInfoHeader(name string, fi os.FileInfo, hdr *zip.FileHeader) {
 	hdr.Name = filepath.ToSlash(name)
 	hdr.UncompressedSize64 = uint64(fi.Size())
@@ -258,7 +277,7 @@ func fileInfoHeader(name string, fi os.FileInfo, hdr *zip.FileHeader) {
 }
 
 func (a *Archiver) createDirectory(idx int, fi os.FileInfo, hdr *zip.FileHeader) error {
-	return a.writeEntry(idx, func() error {
+	return a.writeEntryNoWait(idx, func() error {
 		_, err := a.createHeader(fi, hdr)
 		incOnSuccess(&a.entries, err)
 		return err
@@ -278,7 +297,7 @@ func (a *Archiver) createSymlink(idx int, path string, fi os.FileInfo, hdr *zip.
 	hdr.UncompressedSize64 = hdr.CompressedSize64
 	hdr.CRC32 = crc32.ChecksumIEEE([]byte(link))
 
-	return a.writeEntry(idx, func() error {
+	return a.writeEntryNoWait(idx, func() error {
 		w, err := a.createHeaderRaw(fi, hdr)
 		if err != nil {
 			return err

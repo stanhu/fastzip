@@ -164,9 +164,32 @@ func TestArchiveStableFileOrderIsDeterministic(t *testing.T) {
 			contents: strings.Repeat(fmt.Sprintf("content-%02d-", i), 1024*(i+1)),
 		}
 	}
+	// Directories interleaved with files in sorted order. Their writes are
+	// queued behind in-flight files rather than waited for, so this exercises
+	// that queued entries still land in the right place.
+	for i := 0; i < 20; i++ {
+		testFiles[fmt.Sprintf("tree/d%02d", i)] = testFile{mode: os.ModeDir | 0777}
+		testFiles[fmt.Sprintf("tree/d%02d/f", i)] = testFile{
+			mode:     0666,
+			contents: strings.Repeat(fmt.Sprintf("tree-%02d-", i), 512*(20-i)),
+		}
+	}
+	testFiles["tree"] = testFile{mode: os.ModeDir | 0777}
 
 	files, dir := testCreateFiles(t, testFiles)
 	defer os.RemoveAll(dir)
+
+	wantNames := make([]string, 0, len(files))
+	for name := range files {
+		rel, err := filepath.Rel(dir, name)
+		require.NoError(t, err)
+		rel = filepath.ToSlash(rel)
+		if files[name].IsDir() {
+			rel += "/"
+		}
+		wantNames = append(wantNames, rel)
+	}
+	sort.Strings(wantNames)
 
 	archiveSum := func(t *testing.T, opts ...ArchiverOption) [sha256.Size]byte {
 		f, err := ioutil.TempFile("", "fastzip-stable")
@@ -181,6 +204,15 @@ func TestArchiveStableFileOrderIsDeterministic(t *testing.T) {
 
 		b, err := os.ReadFile(f.Name())
 		require.NoError(t, err)
+
+		zr, err := zip.NewReader(f, int64(len(b)))
+		require.NoError(t, err)
+		gotNames := make([]string, 0, len(zr.File))
+		for _, zf := range zr.File {
+			gotNames = append(gotNames, zf.Name)
+		}
+		require.Equal(t, wantNames, gotNames, "entries not written in sorted order")
+
 		return sha256.Sum256(b)
 	}
 
